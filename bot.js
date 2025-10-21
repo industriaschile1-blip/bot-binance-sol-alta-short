@@ -1,153 +1,231 @@
-// --- 🎛️ CONFIGURACIÓN DE LA ESTRATEGIA AVANZADA ---
-// Modifica estos valores para ajustar el bot a tu necesidad
-const CONFIG = {
-  // --- Parámetros Principales ---
-  symbol: 'SOLUSDT',              // Token a operar (ej: 'BTCUSDT', 'ETHUSDT')
-  triggerPrice: 100.0,            // Precio LÍMITE para la primera compra (ACTIVADOR)
-  // --- Niveles de DCA (Acumulación en Caída) ---
-  numLevels: 4,                   // Número de compras totales (1 a 4). Poner 1 solo activa el TP individual.
-  baseAmount: 20,                 // Cantidad en USDT a invertir en CADA compra
-  dropPercentage: 1.0,            // % de caída entre cada nivel de compra (ej: 1.0 para 1%)
-  // --- Take Profit (Venta en Rebote) ---
-  takeProfitPercentage: 0.8,      // % de ganancia para CADA compra individual (ej: 0.8 para 0.8%)
-  // --- Trailing Stop (Stop Loss Móvil Global) ---
-  trailingStopPercentage: 2.0,    // % de seguimiento para el Trailing Stop (ej: 2.0 para 2%)
-                                  // SE ACTIVA SOLO DESPUÉS DE LA PRIMERA VENTA EXITOSA.
-};
-// --- 🔧 NO TOCAR NADA A PARTIR DE AQUÍ ---
-const axios = require('axios');
+// Importar las librerías necesarias
 const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
-// Variables de entorno seguras desde GitHub
+const axios = require('axios');
+
+// --- CONFIGURACIÓN DINÁMICA (Leída desde Variables de GitHub) ---
+// El bot leerá estos valores desde los "Secrets and Variables" de GitHub.
+const SYMBOL = process.env.SYMBOL || 'SOLUSDT';             // El par a operar (ej. SOLUSDT, BTCUSDT)
+const timeframeMinutes = parseInt(process.env.TIMEFRAME_MINUTES) || 5; // El intervalo en minutos (ej. 5, 15)
+const TIMEFRAME = `${timeframeMinutes}m`;                  // Formato para Binance (ej. '5m')
+
+const TAKE_PROFIT_PERCENT = parseFloat(process.env.TAKE_PROFIT_PERCENT) || 0.5; // Meta de ganancia (0.5 = 0.5%)
+const STOP_LOSS_PERCENT = parseFloat(process.env.STOP_LOSS_PERCENT) || 0.2;     // Límite de pérdida (0.2 = 0.2%)
+const QUANTITY_USDT = parseFloat(process.env.QUANTITY_USDT) || 10;         // Cantidad de dinero a usar
+// --- FIN DE LA CONFIGURACIÓN ---
+
+// Claves de API (leídas de forma segura desde los Secrets de GitHub)
 const API_KEY = process.env.BINANCE_API_KEY;
 const SECRET_KEY = process.env.BINANCE_SECRET_KEY;
-const API_ENDPOINT = process.env.BINANCE_ENDPOINT || 'https://api.binance.us'; // Elige .com o .us
-// --- 📚 FUNCIONES AUXILIARES ---
-function log(message) { console.log(`[${new Date().toISOString()}] ${message}`); }
-function getSignature(queryString) {
-  return crypto.createHmac('sha256', SECRET_KEY).update(queryString).digest('hex');
+const BASE_URL = process.env.BINANCE_ENDPOINT;
+
+// --- LÓGICA DEL BOT (No necesitas cambiar esto) ---
+
+// Función para crear la firma de la petición
+function createSignature(queryString) {
+    return crypto
+        .createHmac('sha256', SECRET_KEY)
+        .update(queryString)
+        .digest('hex');
 }
-async function makeRequest(url, params = {}, method = 'GET') {
-  const timestamp = Date.now();
-  params.timestamp = timestamp;
-  const queryString = Object.keys(params).map(key => `${key}=${encodeURIComponent(params[key])}`).join('&');
-  const signature = getSignature(queryString);
-  const fullUrl = method === 'GET' ? `${url}?${queryString}&signature=${signature}` : `${url}?${queryString}`;
-  try {
-    const response = await axios({ method, url: method === 'GET' ? fullUrl : url, headers: { 'X-MBX-APIKEY': API_KEY }, data: method === 'POST' ? new URLSearchParams({ ...params, signature }).toString() : undefined });
-    return response.data;
-  } catch (error) {
-    log(`❌ ERROR en API: ${error.response?.data?.msg || error.message}`);
-    throw error;
-  }
+
+// Función para hacer peticiones a la API de Binance
+async function binanceRequest(endpoint, params = {}) {
+    if (!API_KEY || !SECRET_KEY || !BASE_URL) {
+        throw new Error("Faltan las claves de API o el endpoint. Revisa los Secrets de GitHub.");
+    }
+
+    params.timestamp = Date.now();
+    const queryString = new URLSearchParams(params).toString();
+    params.signature = createSignature(queryString);
+
+    try {
+        const response = await axios.get(`${BASE_URL}${endpoint}?${queryString}`, {
+            headers: { 'X-MBX-APIKEY': API_KEY }
+        });
+        return response.data;
+    } catch (error) {
+        console.error("Error en la petición a Binance:", error.response ? error.response.data : error.message);
+        throw error;
+    }
 }
-async function getCurrentPrice() {
-  const data = await makeRequest(`${API_ENDPOINT}/api/v3/ticker/price`, { symbol: CONFIG.symbol });
-  return parseFloat(data.price);
-}
-async function getOpenOrders() { return await makeRequest(`${API_ENDPOINT}/api/v3/openOrders`, { symbol: CONFIG.symbol }); }
-async function cancelAllOrders() { return await makeRequest(`${API_ENDPOINT}/api/v3/openOrders`, { symbol: CONFIG.symbol }, 'DELETE'); }
-async function placeOrder(symbol, side, type, quantity, price = null) {
-  const params = { symbol, side, type, quantity: quantity.toFixed(8), timeInForce: 'GTC' };
-  if (price && type === 'LIMIT') params.price = price.toFixed(8);
-  log(`📈 Colocando orden ${side} ${type}: ${quantity.toFixed(4)} a ${price ? '$' + price.toFixed(2) : 'precio de mercado'}`);
-  return await makeRequest(`${API_ENDPOINT}/api/v3/order`, params, 'POST');
-}
-// --- 💾 GESTIÓN DE ESTADO ---
-const STATE_FILE = path.join(__dirname, 'state.json');
-function loadState() { return fs.existsSync(STATE_FILE) ? JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) : { status: 'IDLE' }; }
-function saveState(state) { fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2)); }
-// --- 🤖 LÓGICA PRINCIPAL DEL BOT ---
-async function runBot() {
-  log('🚀 Iniciando ejecución del Bot de Trading Avanzado...');
-  if (!API_KEY || !SECRET_KEY) throw new Error("❌ FALTAN LAS CLAVES DE API. Añádelas como 'Secrets' en GitHub.");
-  if (CONFIG.numLevels < 1 || CONFIG.numLevels > 4) throw new Error("❌ 'numLevels' debe estar entre 1 y 4.");
-  let state = loadState();
-  log(`📊 Estado actual: ${state.status}`);
-  const currentPrice = await getCurrentPrice();
-  log(`💰 Precio actual de ${CONFIG.symbol}: $${currentPrice}`);
-  // --- Máquina de Estados ---
-  if (state.status === 'IDLE' || state.status === 'STOPPED') {
-    log('🎯 Bot inactivo. Esperando activación...');
-    if (currentPrice <= CONFIG.triggerPrice) {
-      log(`✅ Precio de activación alcanzado ($${CONFIG.triggerPrice}). Iniciando secuencia de compra.`);
-      state.status = 'ACTIVE';
-      state.levels = [];
-      state.trailingStop = { active: false, peakPrice: 0 };
-      state.totalQuantityBought = 0;
-      for (let i = 0; i < CONFIG.numLevels; i++) {
-        const buyPrice = CONFIG.triggerPrice * Math.pow(1 - CONFIG.dropPercentage / 100, i);
-        const quantity = CONFIG.baseAmount / buyPrice;
-        state.levels.push({ level: i + 1, buyPrice, quantity, buyOrderId: null, sellOrderId: null, isComplete: false });
-      }
-      saveState(state);
-      log(`✅ ${CONFIG.numLevels} niveles de compra definidos.`);
-    }
-  }
-  if (state.status === 'ACTIVE') {
-    // 1. Colocar órdenes si no existen
-    for (const level of state.levels) {
-      if (!level.buyOrderId) {
-        const order = await placeOrder(CONFIG.symbol, 'BUY', 'LIMIT', level.quantity, level.buyPrice);
-        level.buyOrderId = order.orderId;
-        saveState(state);
-      }
-    }
-    const openOrders = await getOpenOrders();
-    const openOrderIds = new Set(openOrders.map(o => o.orderId.toString()));
-    // 2. Comprobar compras ejecutadas y colocar TPs
-    for (const level of state.levels) {
-      if (level.buyOrderId && !openOrderIds.has(level.buyOrderId) && !level.sellOrderId) {
-        log(`🎉 Compra Nivel ${level.level} ejecutada a $${level.buyPrice.toFixed(2)}.`);
-        state.totalQuantityBought += level.quantity;
-        const sellPrice = level.buyPrice * (1 + CONFIG.takeProfitPercentage / 100);
-        const sellOrder = await placeOrder(CONFIG.symbol, 'SELL', 'LIMIT', level.quantity, sellPrice);
-        level.sellOrderId = sellOrder.orderId;
-        saveState(state);
-      }
-    }
-    // 3. Comprobar ventas ejecutadas
-    let firstSaleCompleted = false;
-    for (const level of state.levels) {
-      if (level.sellOrderId && !openOrderIds.has(level.sellOrderId) && !level.isComplete) {
-        log(`💰 Venta Nivel ${level.level} completada con ganancia.`);
-        level.isComplete = true;
-        state.totalQuantityBought -= level.quantity;
-        firstSaleCompleted = true;
-        saveState(state);
-      }
-    }
-    // 4. Activar Trailing Stop si es la primera venta
-    if (firstSaleCompleted && !state.trailingStop.active) {
-      log('🚀 ¡PRIMERA VENTA EXITOSA! Activando Trailing Stop global.');
-      state.trailingStop.active = true;
-      state.trailingStop.peakPrice = currentPrice;
-      saveState(state);
-    }
-    // 5. Gestionar Trailing Stop Activo
-    if (state.trailingStop.active) {
-      if (currentPrice > state.trailingStop.peakPrice) {
-        state.trailingStop.peakPrice = currentPrice;
-        log(`📈 Nuevo pico del Trailing Stop: $${state.trailingStop.peakPrice.toFixed(2)}`);
-        saveState(state);
-      }
-      const stopLossPrice = state.trailingStop.peakPrice * (1 - CONFIG.trailingStopPercentage / 100);
-      if (currentPrice <= stopLossPrice) {
-        log(`🛑 TRAILING STOP ACTIVADO! Vendiendo posición restante de ${state.totalQuantityBought.toFixed(4)} tokens.`);
-        if (state.totalQuantityBought > 0) {
-            await cancelAllOrders(); // Cancelar TPs restantes
-            await placeOrder(CONFIG.symbol, 'SELL', 'MARKET', state.totalQuantityBought);
+
+// Función para verificar la conexión y los permisos de la API
+async function checkApiPermissions() {
+    console.log("Verificando conexión y permisos de la API...");
+    try {
+        const accountInfo = await binanceRequest('/fapi/v2/account');
+        const canTrade = accountInfo.canTrade;
+        if (!canTrade) {
+            throw new Error("La API Key no tiene permisos para operar (canTrade: false). Actívalos en la configuración de Binance.");
         }
-        state.status = 'STOPPED';
-        saveState(state);
-        log('🏁 Bot detenido. Ciclo completado.');
-        return "Ciclo completado por Trailing Stop.";
-      }
+        console.log("✅ API Key verificada y con permisos para operar.");
+        return accountInfo;
+    } catch (error) {
+        console.error("❌ Error crítico al verificar la API Key. Deteniendo el bot.");
+        console.error("Posibles causas:");
+        console.error("1. API Key o Secret Key incorrectas.");
+        console.error("2. La API Key no tiene permisos para 'Futures Trading'.");
+        console.error("3. Restricciones de IP en la API Key.");
+        throw error;
     }
-  }
-  saveState(state);
-  log('✅ Ciclo del bot finalizado. Estado guardado.');
-  return "Ejecución completada.";
 }
-runBot().catch(err => { log(`💥 FATAL: ${err.message}`); process.exit(1); });
+
+// Función para obtener el precio actual
+async function getCurrentPrice() {
+    try {
+        const ticker = await binanceRequest('/fapi/v1/ticker/price', { symbol: SYMBOL });
+        return parseFloat(ticker.price);
+    } catch (error) {
+        console.error(`Error al obtener el precio actual de ${SYMBOL}:`, error.message);
+        throw error;
+    }
+}
+
+// Función para obtener el balance de USDT disponible
+async function getUsdtBalance() {
+    try {
+        const account = await binanceRequest('/fapi/v2/account');
+        const asset = account.assets.find(a => a.asset === 'USDT');
+        return asset ? parseFloat(asset.availableBalance) : 0;
+    } catch (error) {
+        console.error("Error al obtener el balance de USDT:", error.message);
+        throw error;
+    }
+}
+
+// Función para calcular la cantidad a comprar
+function calculateQuantity(price) {
+    return QUANTITY_USDT / price;
+}
+
+// Función para colocar una orden
+async function placeOrder(symbol, side, type, quantity, price = null, timeInForce = 'GTC', stopPrice = null) {
+    const orderParams = { symbol, side, type, quantity, timeInForce };
+    if (type === 'LIMIT' && price !== null) orderParams.price = price.toFixed(4);
+    if (type === 'STOP_MARKET' && stopPrice !== null) orderParams.stopPrice = stopPrice.toFixed(4);
+    
+    // Reducir la precisión de la cantidad para evitar errores
+    const assetInfo = await binanceRequest('/fapi/v1/exchangeInfo', { symbol: symbol });
+    const symbolInfo = assetInfo.symbols[0];
+    const lotSizeFilter = symbolInfo.filters.find(f => f.filterType === 'LOT_SIZE');
+    const tickSize = parseFloat(lotSizeFilter.stepSize);
+    const precision = Math.floor(Math.log10(1 / tickSize));
+    orderParams.quantity = parseFloat(quantity.toFixed(precision));
+
+    try {
+        const order = await binanceRequest('/fapi/v1/order', orderParams);
+        console.log(`✅ Orden ${side} colocada exitosamente:`, order);
+        return order;
+    } catch (error) {
+        console.error(`❌ Error al colocar orden ${side}:`, error.response ? error.response.data : error.message);
+        throw error;
+    }
+}
+
+// --- LÓGICA DE ESTRATEGIA ---
+
+// Estrategia: Compra y venta inmediata con Take Profit y Stop Loss
+async function runBuyAndSellStrategy() {
+    console.log(`\n--- Iniciando ciclo de trading para ${SYMBOL} ---`);
+    try {
+        const currentPrice = await getCurrentPrice();
+        console.log(`Precio actual de ${SYMBOL}: ${currentPrice}`);
+
+        const quantityToBuy = calculateQuantity(currentPrice);
+        console.log(`Se intentará comprar ${quantityToBuy.toFixed(4)} ${SYMBOL} por un valor de ${QUANTITY_USDT} USDT.`);
+
+        // 1. Colocar orden de mercado de compra
+        const buyOrder = await placeOrder(SYMBOL, 'BUY', 'MARKET', quantityToBuy);
+        const avgBuyPrice = parseFloat(buyOrder.avgPrice);
+        console.log(`📈 Compra ejecutada a precio promedio: ${avgBuyPrice}`);
+
+        // 2. Calcular precios de Take Profit y Stop Loss
+        const takeProfitPrice = avgBuyPrice * (1 + TAKE_PROFIT_PERCENT / 100);
+        const stopLossPrice = avgBuyPrice * (1 - STOP_LOSS_PERCENT / 100);
+
+        console.log(`🎯 Precio de Take Profit establecido en: ${takeProfitPrice.toFixed(4)} (+${TAKE_PROFIT_PERCENT}%)`);
+        console.log(`🛡️ Precio de Stop Loss establecido en: ${stopLossPrice.toFixed(4)} (-${STOP_LOSS_PERCENT}%)`);
+
+        // 3. Colocar orden de venta con Take Profit (LIMIT)
+        await placeOrder(SYMBOL, 'SELL', 'LIMIT', quantityToBuy, takeProfitPrice);
+
+        // 4. Colocar orden de venta con Stop Loss (STOP_MARKET)
+        await placeOrder(SYMBOL, 'SELL', 'STOP_MARKET', quantityToBuy, null, 'GTC', stopLossPrice);
+        
+        console.log("--- Operación completada. Órdenes de TP y SL colocadas. ---");
+
+    } catch (error) {
+        console.error("--- Ocurrió un error en el ciclo de trading. ---");
+        console.error(error.message);
+        // Aquí podrías añadir lógica para notificar el error.
+    }
+}
+
+// --- FUNCIÓN PRINCIPAL ---
+async function main() {
+    try {
+        await checkApiPermissions();
+        const usdtBalance = await getUsdtBalance();
+        console.log(`Balance disponible de USDT: ${usdtBalance.toFixed(2)}`);
+
+        if (usdtBalance < QUANTITY_USDT) {
+            console.warn(`⚠️ Advertencia: El balance de USDT (${usdtBalance.toFixed(2)}) es menor que la cantidad a operar (${QUANTITY_USDT}). No se realizará la operación.`);
+            return;
+        }
+
+        await runBuyAndSellStrategy();
+
+    } catch (error) {
+        console.error("El bot no pudo completar su ejecución debido a un error crítico.");
+    }
+}
+
+main();
+Haz clic en el botón verde Commit changes... para guardar el archivo.
+Paso 2: Actualizar el Programador (main.yml)
+Ve a la carpeta .github/workflows/.
+Haz clic en el archivo main.yml y luego en el ícono del lápiz ✏️ (Edit this file).
+BORRA TODO EL CONTENIDO y REEMPLÁZALO por este código completo:
+name: Bot de Trading Avanzado
+
+# Se ejecuta automáticamente cada 5 minutos y también permite ejecución manual
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  run-trading-bot:
+    runs-on: ubuntu-latest
+    
+    # Variables de configuración del bot (leyendo desde 'Variables' del repositorio)
+    env:
+      SYMBOL: ${{ vars.SYMBOL }}
+      TIMEFRAME_MINUTES: ${{ vars.TIMEFRAME_MINUTES }}
+      TAKE_PROFIT_PERCENT: ${{ vars.TAKE_PROFIT_PERCENT }}
+      STOP_LOSS_PERCENT: ${{ vars.STOP_LOSS_PERCENT }}
+      QUANTITY_USDT: ${{ vars.QUANTITY_USDT }}
+
+    steps:
+      # 1. Descargar el código del repositorio
+      - name: Clonar el repositorio
+        uses: actions/checkout@v3
+
+      # 2. Instalar Node.js
+      - name: Configurar Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      # 3. Instalar las dependencias (axios)
+      - name: Instalar dependencias
+        run: npm install
+
+      # 4. Ejecutar el script del bot, pasándole los secretos de forma segura
+      - name: Ejecutar Bot de Trading
+        run: node bot.js
+        env:
+          # Los secretos se pasan solo en este paso, por seguridad
+          BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
+          BINANCE_SECRET_KEY: ${{ secrets.BINANCE_SECRET_KEY }}
+          BINANCE_ENDPOINT: ${{ secrets.BINANCE_ENDPOINT }}
